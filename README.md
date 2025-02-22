@@ -15,7 +15,7 @@
 pip install -r requirements.txt
 ```
 
-Вам також потрібно буде додати свої ключі API Gemini... до `.env` файлу.
+Вам також потрібно буде додати свої ключі API Gemini, Groq, Langchain до `.env` файлу.
 
 ## Використання
 
