@@ -9,6 +9,8 @@ from functools import partial
 import aiohttp
 from tenacity import retry, stop_after_attempt, wait_exponential
 import time
+import json
+import re
 
 # Import required libraries
 from unstructured.partition.pdf import partition_pdf
@@ -264,85 +266,299 @@ def add_documents_to_retriever(retriever: MultiVectorRetriever, texts: List, tab
 
     status_text.text("Documents added to retriever!")
 
+def extract_references(texts: List) -> List[str]:
+    """Extract and process references from text content"""
+    references = []
+    
+    # Common patterns for references
+    reference_indicators = [
+        "References:",
+        "Bibliography:",
+        "Further reading:",
+        "See also:",
+        "Related articles:",
+        "Sources:",
+    ]
+    
+    for text in texts:
+        content = str(text)
+        # Check if this section contains references
+        if any(indicator.lower() in content.lower() for indicator in reference_indicators):
+            # Split by newlines to separate individual references
+            lines = content.split('\n')
+            for line in lines:
+                # Skip empty lines and headers
+                if line.strip() and not any(indicator in line for indicator in reference_indicators):
+                    references.append(line.strip())
+    
+    return references
+
+async def summarize_references(references: List[str], groq_model: Any) -> List[Dict]:
+    """Summarize each reference with its topic and relevance"""
+    if not references:
+        return []
+    
+    status_text = st.empty()
+    status_text.text("Analyzing references...")
+    
+    reference_prompt = ChatPromptTemplate.from_template("""
+    For this reference: {reference}
+    Provide a brief analysis in JSON format with these fields:
+    - title: The main title or topic
+    - type: The type of reference (article, book, website, etc.)
+    - relevance: A brief note about its relevance to the main document
+    Keep each field concise (max 2 sentences).
+    """)
+    
+    reference_chain = {"reference": lambda x: x} | reference_prompt | groq_model | StrOutputParser()
+    
+    summaries = []
+    for i, ref in enumerate(references):
+        try:
+            summary = await reference_chain.ainvoke(ref)
+            summaries.append(summary)
+            st.write(f"✓ Processed reference {i+1}/{len(references)}")
+        except Exception as e:
+            st.warning(f"Failed to process reference: {str(e)}")
+    
+    status_text.text("Reference analysis complete!")
+    return summaries
+
+def analyze_document_structure(texts: List, tables: List, images: List) -> Dict:
+    """Analyze the document structure and create a hierarchical map"""
+    structure = {
+        "sections": [],
+        "internal_links": [],
+        "cross_references": [],
+        "hierarchy": {}
+    }
+    
+    current_section = None
+    current_level = 0
+    
+    # Common section indicators
+    section_patterns = [
+        r"^(?:Chapter|Section)\s+\d+",
+        r"^\d+\.\d*\s+",
+        r"^[IVXLCDM]+\.",
+        r"^[A-Z]\.",
+    ]
+    
+    for i, text in enumerate(texts):
+        content = str(text)
+        lines = content.split('\n')
+        
+        # Analyze first line for potential section header
+        if lines and any(re.match(pattern, lines[0].strip()) for pattern in section_patterns):
+            section = {
+                "title": lines[0].strip(),
+                "index": i,
+                "content_type": "text",
+                "subsections": [],
+                "links": [],
+                "references": []
+            }
+            
+            # Detect section level based on formatting
+            if re.match(r"^\d+\.\d+\.\d+", lines[0]):
+                level = 3
+            elif re.match(r"^\d+\.\d+", lines[0]):
+                level = 2
+            else:
+                level = 1
+                
+            # Add to hierarchy
+            if level == 1:
+                structure["hierarchy"][section["title"]] = {"subsections": [], "content": []}
+                current_section = section["title"]
+            elif current_section:
+                structure["hierarchy"][current_section]["subsections"].append(section["title"])
+            
+            structure["sections"].append(section)
+            
+        # Look for links and references
+        for line in lines:
+            # Find internal links (e.g., "see Section 2.1")
+            internal_links = re.findall(r"see (?:Section|Chapter|Fig\.|Table)\s+[\d\.]+", line)
+            if internal_links:
+                if current_section:
+                    structure["hierarchy"][current_section]["content"].append({
+                        "type": "internal_link",
+                        "text": internal_links
+                    })
+                structure["internal_links"].extend(internal_links)
+            
+            # Find cross-references
+            cross_refs = re.findall(r"\[[\d,\s-]+\]", line)
+            if cross_refs:
+                structure["cross_references"].extend(cross_refs)
+                
+    # Map tables and images to sections
+    for i, table in enumerate(tables):
+        if current_section:
+            structure["hierarchy"][current_section]["content"].append({
+                "type": "table",
+                "index": i
+            })
+            
+    for i, image in enumerate(images):
+        if current_section:
+            structure["hierarchy"][current_section]["content"].append({
+                "type": "image",
+                "index": i
+            })
+    
+    return structure
+
+def display_document_structure(structure: Dict):
+    """Display the document structure analysis in a readable format"""
+    st.header("📑 Document Structure Analysis")
+    
+    # Basic statistics
+    st.subheader("Document Statistics")
+    st.write(f"- Number of main sections: {len(structure['sections'])}")
+    st.write(f"- Internal links found: {len(structure['internal_links'])}")
+    st.write(f"- Cross-references: {len(structure['cross_references'])}")
+    
+    # Section Hierarchy
+    st.subheader("Section Hierarchy")
+    for section, details in structure["hierarchy"].items():
+        st.markdown(f"### {section}")
+        if details["subsections"]:
+            st.markdown("**Subsections:**")
+            for subsection in details["subsections"]:
+                st.markdown(f"- {subsection}")
+        
+        if details["content"]:
+            st.markdown("**Content Elements:**")
+            for item in details["content"]:
+                if item["type"] == "internal_link":
+                    st.markdown(f"🔗 Links to: {', '.join(item['text'])}")
+                elif item["type"] == "table":
+                    st.markdown(f"📊 Table {item['index'] + 1}")
+                elif item["type"] == "image":
+                    st.markdown(f"🖼️ Figure {item['index'] + 1}")
+    
+    # Internal Navigation
+    if structure["internal_links"]:
+        st.subheader("Internal Navigation")
+        st.markdown("**Document Cross-References:**")
+        for link in structure["internal_links"]:
+            st.markdown(f"- {link}")
+
 async def main():
     st.title("Multi-modal PDF Analyzer")
     st.write("Upload a PDF file for comprehensive analysis")
 
-    # File upload
     uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
     
     if uploaded_file is not None:
         st.info(f"Processing: {uploaded_file.name}")
         
+        # Setup phase
         with st.spinner("Setting up environment..."):
             setup_api_keys()
             retriever = setup_retriever()
 
-        # Process PDF with progress tracking
-        with st.expander("PDF Processing Details", expanded=True):
+        # Create tabs for different analyses
+        tab1, tab2, tab3, tab4 = st.tabs(["PDF Processing", "Document Structure", "Content Analysis", "Q&A"])
+        
+        with tab1:
+            # Process PDF
             texts, tables, images = process_pdf(uploaded_file)
-
-        # Generate summaries with progress tracking
-        with st.expander("Content Analysis Details", expanded=True):
+        
+        with tab2:
+            # Document Structure Analysis
+            structure = analyze_document_structure(texts, tables, images)
+            display_document_structure(structure)
+            
+            # Add structure info to retriever
+            doc = Document(
+                page_content=str(structure),
+                metadata={
+                    "doc_id": "structure",
+                    "source": "structure_analysis",
+                    "type": "document_structure"
+                }
+            )
+            retriever.vectorstore.add_documents([doc])
+            retriever.docstore.mset([("structure", doc)])
+        
+        with tab3:
+            # Content Analysis
             summaries = await summarize_content(texts, tables, images)
+            
+            # Add documents to retriever
+            add_documents_to_retriever(retriever, texts, tables, summaries)
 
-        # Add documents to retriever
-        add_documents_to_retriever(retriever, texts, tables, summaries)
+            # Display results
+            if summaries["text_summaries"]:
+                st.subheader("📄 Text Content")
+                for i, summary in enumerate(summaries["text_summaries"]):
+                    with st.expander(f"Text Section {i+1}"):
+                        st.write(summary)
 
-        # Display results
-        st.header("Analysis Results")
+            if summaries["table_summaries"]:
+                st.subheader("📊 Table Content")
+                for i, summary in enumerate(summaries["table_summaries"]):
+                    with st.expander(f"Table {i+1}"):
+                        st.write(summary)
 
-        # Text analysis
-        if summaries["text_summaries"]:
-            st.subheader("📄 Text Content")
-            for i, summary in enumerate(summaries["text_summaries"]):
-                with st.expander(f"Text Section {i+1}"):
-                    st.write(summary)
+            if summaries["image_summaries"]:
+                st.subheader("🖼️ Image Content")
+                for i, (image, summary) in enumerate(zip(images, summaries["image_summaries"])):
+                    with st.expander(f"Image {i+1}"):
+                        st.image(f"data:image/jpeg;base64,{image}")
+                        st.write(summary)
 
-        # Table analysis
-        if summaries["table_summaries"]:
-            st.subheader("📊 Table Content")
-            for i, summary in enumerate(summaries["table_summaries"]):
-                with st.expander(f"Table {i+1}"):
-                    st.write(summary)
-
-        # Image analysis
-        if summaries["image_summaries"]:
-            st.subheader("🖼️ Image Content")
-            for i, (image, summary) in enumerate(zip(images, summaries["image_summaries"])):
-                with st.expander(f"Image {i+1}"):
-                    st.image(f"data:image/jpeg;base64,{image}")
-                    st.write(summary)
-
-        # Add a Q&A section
-        st.header("🤔 Ask Questions")
-        question = st.text_input("Ask a question about the document:")
-        if question:
-            with st.spinner("Generating answer..."):
-                try:
-                    # Setup RAG chain
-                    gemini = ChatGoogleGenerativeAI(
-                        model="gemini-1.5-flash",
-                        temperature=0.3,
-                        max_retries=3,
-                        timeout=30
-                    )
-                    docs = retriever.get_relevant_documents(question)
-                    
-                    # Generate response with retry logic
-                    context = ' '.join(str(doc.page_content) for doc in docs)
-                    response = await generate_answer(gemini, question, context)
-                    
-                    st.write("Answer:", response)
-                except Exception as e:
-                    st.error("""
-                    Rate limit reached. Please wait a moment before asking another question.
-                    
-                    Tips:
-                    - Wait 30-60 seconds before trying again
-                    - Try rephrasing your question
-                    - Break complex questions into simpler ones
-                    """)
+            # References section
+            st.subheader("📚 References")
+            references = extract_references(texts)
+            if references:
+                reference_summaries = await summarize_references(references, groq_model)
+                for i, (ref, summary) in enumerate(zip(references, reference_summaries)):
+                    with st.expander(f"Reference {i+1}"):
+                        st.text("Original reference:")
+                        st.write(ref)
+                        st.text("Analysis:")
+                        try:
+                            summary_dict = json.loads(summary)
+                            st.write("Title:", summary_dict.get("title"))
+                            st.write("Type:", summary_dict.get("type"))
+                            st.write("Relevance:", summary_dict.get("relevance"))
+                        except json.JSONDecodeError:
+                            st.write(summary)
+            else:
+                st.info("No references found in the document.")
+        
+        with tab4:
+            # Q&A Section
+            st.header("🤔 Ask Questions")
+            question = st.text_input("Ask a question about the document:")
+            if question:
+                with st.spinner("Generating answer..."):
+                    try:
+                        gemini = ChatGoogleGenerativeAI(
+                            model="gemini-1.5-flash",
+                            temperature=0.3,
+                            max_retries=3,
+                            timeout=30
+                        )
+                        docs = retriever.get_relevant_documents(question)
+                        
+                        context = ' '.join(str(doc.page_content) for doc in docs)
+                        response = await generate_answer(gemini, question, context)
+                        
+                        st.write("Answer:", response)
+                    except Exception as e:
+                        st.error("""
+                        Rate limit reached. Please wait a moment before asking another question.
+                        
+                        Tips:
+                        - Wait 30-60 seconds before trying again
+                        - Try rephrasing your question
+                        - Break complex questions into simpler ones
+                        """)
 
 if __name__ == "__main__":
     asyncio.run(main())
