@@ -19,7 +19,7 @@ source venv/bin/activate
 # 2. Зробіть апгрейд pip
 pip install --upgrade pip
 
-# 4. Install requirements
+# 3. Встановіть залежності
 pip install -r requirements.txt
 ```
 
